@@ -1,0 +1,21 @@
+{
+  "name": "threedollarai-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Verifies 3Dollar AI subscriptions with Google Play and proxies the plan's AI endpoint so its key never ships in the app.",
+  "type": "module",
+  "main": "src/server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch --env-file-if-exists=.env src/server.js",
+    "test": "node --test --test-timeout=15000"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "google-auth-library": "^10.3.0",
+    "jose": "^6.1.0"
+  }
+}
