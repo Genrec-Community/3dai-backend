@@ -1,282 +1,100 @@
-// The HTTP surface:
-//   POST /auth                   purchase token -> pass
-//   POST /v1/chat/completions    pass -> the AI endpoint, key added here
-//   GET  /v1/models              pass -> the one model the plan offers
-//   GET  /health
+'use strict';
+const express = require('express');
+const { Readable } = require('node:stream');
+const pass = require('./pass');
+const { createLimiter } = require('./ratelimit');
 
-import { Readable, Transform } from 'node:stream';
-import { pipeline } from 'node:stream/promises';
-import express from 'express';
-import { createPassIssuer, subscriberId } from './pass.js';
-import { fetchWithRetry } from './retry.js';
-
-
-/** OpenAI-style error body, which the app's client already understands. */
-function fail(res, status, code, message, extra = {}) {
-  res.status(status).json({ error: { code, message, type: code }, ...extra });
+class HttpError extends Error {
+  constructor(status, code) {
+    super(code);
+    this.status = status;
+  }
 }
 
-function bearer(req) {
-  const header = req.get('authorization') ?? '';
-  return header.startsWith('Bearer ') ? header.slice(7).trim() : null;
-}
+const bearer = (req) => (req.get('authorization') || '').match(/^Bearer\s+(.+)$/i)?.[1] ?? null;
 
 /**
- * Passes bytes through and calls `onIdle` if none arrive for `ms`: an
- * upstream that goes silent mid-reply would otherwise hold the connection,
- * and the subscriber's slot, forever.
+ * deps:
+ *  verifyFirebaseToken(idToken) -> { uid }   (throws if invalid)
+ *  checkSubscription(purchaseToken) -> { valid, temporary, accountId, expiresAt }
+ *  fetchImpl                         upstream HTTP client
+ *  config: { passSecret, passTtlSeconds, upstreamBase, upstreamKey,
+ *            requireAccountBinding, rateLimitPerMin }
  */
-function idleGuard(ms, onIdle) {
-  if (!ms) return new Transform({ transform: (chunk, _enc, cb) => cb(null, chunk) });
-  let timer;
-  const arm = () => {
-    clearTimeout(timer);
-    timer = setTimeout(() => {
-      onIdle();
-      // Breaks the pipeline here, whether or not the upstream connection
-      // reacts to being cancelled.
-      guard.destroy(new Error('upstream went silent'));
-    }, ms);
-  };
-  const guard = new Transform({
-    transform(chunk, _enc, cb) {
-      arm();
-      cb(null, chunk);
-    },
-    destroy(err, cb) {
-      clearTimeout(timer);
-      cb(err);
-    },
-    flush(cb) {
-      clearTimeout(timer);
-      cb();
-    },
-  });
-  arm();
-  return guard;
-}
-
-/**
- * @param {object} deps
- * @param {object} deps.config            see config.js
- * @param {(token: string) => Promise<{active: boolean, expiresAt?: number, reason?: string}>} deps.verifyPurchase
- * @param {typeof fetch} [deps.fetchImpl]
- * @param {() => number} [deps.now]
- * @param {(ms: number, signal?: AbortSignal) => Promise<void>} [deps.sleep]  wait between retries
- * @param {(message: string, detail?: unknown) => void} [deps.log]
- */
-export function createApp({
-  config,
-  verifyPurchase,
-  fetchImpl = fetch,
-  now = () => Date.now(),
-  sleep,
-  log = (message, detail) => console.error(message, detail ?? ''),
-}) {
-  const passes = createPassIssuer({
-    secret: config.passSecret,
-    ttlSeconds: config.passTtlSeconds,
-    now,
-  });
+function createApp({ verifyFirebaseToken, checkSubscription, fetchImpl = fetch, config, now = Date.now }) {
   const app = express();
+  const allow = createLimiter({ max: config.rateLimitPerMin, now });
   app.disable('x-powered-by');
+  app.use(express.json({ limit: '1mb' }));
 
-  app.use((_req, res, next) => {
-    res.set('X-Content-Type-Options', 'nosniff');
-    next();
-  });
+  app.get('/healthz', (_req, res) => res.json({ ok: true }));
 
-  app.get('/health', (_req, res) => res.json({ ok: true }));
-
-  // ------------------------------------------------------------ /auth
-  app.post(
-    '/auth',
-    express.json({ limit: '16kb' }),
-    async (req, res) => {
-      // The reply carries a credential.
-      res.set('Cache-Control', 'no-store');
+  // Trade (Firebase login + Play purchase token) for a short-lived pass.
+  app.post('/auth', async (req, res) => {
+    try {
+      const idToken = bearer(req);
+      if (!idToken) throw new HttpError(401, 'missing_login');
+      let uid;
+      try {
+        ({ uid } = await verifyFirebaseToken(idToken));
+      } catch {
+        throw new HttpError(401, 'invalid_login');
+      }
       const purchaseToken = req.body?.purchaseToken;
-      if (
-        typeof purchaseToken !== 'string' ||
-        purchaseToken.length < 8 ||
-        purchaseToken.length > 4096
-      ) {
-        return fail(res, 400, 'bad_request', 'purchaseToken is required.');
+      if (typeof purchaseToken !== 'string' || !purchaseToken.trim()) {
+        throw new HttpError(400, 'purchase_token_required');
       }
-
-      let result;
-      try {
-        result = await verifyPurchase(purchaseToken);
-      } catch (e) {
-        // Not the user's fault, and not proof the subscription ended: the
-        // app should keep its current pass and try again later.
-        log('Purchase check failed', e);
-        return fail(
-          res,
-          503,
-          'verify_unavailable',
-          'Could not check the subscription right now.',
-        );
+      const result = await checkSubscription(purchaseToken.trim());
+      if (result.temporary) throw new HttpError(503, 'verification_unavailable');
+      if (!result.valid) throw new HttpError(403, 'subscription_inactive');
+      // The purchase must have been made by this signed-in user, so one
+      // subscription can't be shared across accounts.
+      if (config.requireAccountBinding && result.accountId !== uid) {
+        throw new HttpError(403, 'purchase_not_yours');
       }
-      if (!result.active) {
-        return fail(res, 403, 'plan_inactive', 'No active subscription.', {
-          reason: result.reason,
-        });
-      }
-      const pass = await passes.issue(subscriberId(purchaseToken), result.expiresAt);
-      res.json({
-        pass: pass.token,
-        expiresAt: new Date(pass.expiresAt).toISOString(),
-        subscriptionExpiresAt: result.expiresAt
-          ? new Date(result.expiresAt).toISOString()
-          : null,
-      });
-    },
-  );
-
-  // ------------------------------------------------- everything under /v1
-  const v1 = express.Router();
-
-  v1.use(async (req, res, next) => {
-    const subscriber = await passes.verify(bearer(req));
-    if (!subscriber) {
-      return fail(res, 401, 'invalid_pass', 'Sign in to the plan again.');
+      return res.json(pass.issue(uid, config.passTtlSeconds, config.passSecret, now()));
+    } catch (e) {
+      const status = e instanceof HttpError ? e.status : 500;
+      if (status === 500) console.error('auth failed', e?.message);
+      return res.status(status).json({ error: e instanceof HttpError ? e.message : 'server_error' });
     }
-    req.subscriber = subscriber;
-    next();
   });
 
-  v1.get('/models', (_req, res) => {
-    res.json({
-      object: 'list',
-      data: [{ id: config.upstreamModel, object: 'model', owned_by: 'threedollarai' }],
-    });
-  });
+  // OpenAI-compatible proxy. The real key never leaves this process.
+  app.use('/v1', async (req, res) => {
+    const claims = pass.verify(bearer(req), config.passSecret, now());
+    if (!claims) return res.status(401).json({ error: 'invalid_pass' });
+    if (!allow(claims.sub)) return res.status(429).json({ error: 'rate_limited' });
+    if (req.method !== 'GET' && req.method !== 'POST') return res.status(405).end();
+    const path = req.url.replace(/^\/+/, '');
+    if (path !== 'chat/completions' && path !== 'models') return res.status(404).end();
 
-  v1.post(
-    '/chat/completions',
-    express.json({ limit: config.maxBodyBytes }),
-    async (req, res) => {
-      let body = req.body;
-      if (!body || typeof body !== 'object' || !Array.isArray(body.messages)) {
-        return fail(res, 400, 'bad_request', 'messages is required.');
-      }
-      // The plan is one model. Pinning it here means a leaked pass can't be
-      // used to reach anything more expensive on the upstream account.
-      body.model = config.upstreamModel;
-      // One answer per request; `n` would multiply the cost of each one.
-      delete body.n;
-      // Lets the upstream attribute abuse without learning who the user is.
-      body.user = req.subscriber;
-
-      // Stop paying for a reply nobody is waiting for.
-      const abort = new AbortController();
-      res.on('close', () => {
-        if (!res.writableEnded) abort.abort();
+    const controller = new AbortController();
+    res.on('close', () => controller.abort());
+    try {
+      const upstream = await fetchImpl(`${config.upstreamBase}/${path}`, {
+        method: req.method,
+        headers: {
+          authorization: `Bearer ${config.upstreamKey}`,
+          ...(req.method === 'POST' ? { 'content-type': 'application/json' } : {}),
+        },
+        body: req.method === 'POST' ? JSON.stringify(req.body ?? {}) : undefined,
+        signal: controller.signal,
       });
-
-      // Retries happen here, before any of the reply has been sent, so the
-      // app sees one clean response however many tries it took.
-      let upstream;
-      try {
-        upstream = await fetchWithRetry(
-          fetchImpl,
-          `${config.upstreamBaseUrl}/chat/completions`,
-          {
-            method: 'POST',
-            headers: {
-              'content-type': 'application/json',
-              accept: req.get('accept') ?? 'application/json',
-              authorization: `Bearer ${config.upstreamApiKey}`,
-            },
-            body: JSON.stringify(body),
-          },
-          {
-            attempts: config.upstreamAttempts,
-            baseDelayMs: config.retryBaseDelayMs,
-            maxDelayMs: config.retryMaxDelayMs,
-            attemptTimeoutMs: config.upstreamTimeoutMs,
-            deadlineMs: config.upstreamDeadlineMs,
-            signal: abort.signal,
-            sleep,
-            now,
-            onRetry: ({ attempt, status, error, waitMs }) =>
-              log(
-                `Upstream try ${attempt} failed (${status ?? error?.message}); ` +
-                  `retrying in ${Math.round(waitMs)} ms`,
-              ),
-          },
-        );
-      } catch (e) {
-        if (abort.signal.aborted) return;
-        log('Upstream unreachable', e);
-        return fail(res, 502, 'upstream_unreachable', 'The AI service is not responding.');
-      }
-
-      // The request has been delivered; a long reply shouldn't keep
-      // megabytes of it alive while it streams.
-      req.body = undefined;
-      body = undefined;
-
-      // A rejected key is our problem, never the user's: don't let the app
-      // think its own sign-in failed, and don't echo upstream auth errors.
-      if (upstream.status === 401 || upstream.status === 403) {
-        log(`Upstream rejected our key (${upstream.status})`);
-        await upstream.body?.cancel().catch(() => {});
-        return fail(res, 502, 'upstream_auth', 'The AI service is misconfigured.');
-      }
-
       res.status(upstream.status);
-      for (const name of ['content-type', 'retry-after']) {
-        const value = upstream.headers.get(name);
-        if (value) res.set(name, value);
-      }
-      // Server-sent events must reach the app as they are produced, and a
-      // reply is for one person: nothing in between may store it.
-      res.set('Cache-Control', 'no-store, no-transform');
-      res.set('X-Accel-Buffering', 'no');
-      res.flushHeaders();
-
+      const type = upstream.headers.get('content-type');
+      if (type) res.set('content-type', type);
       if (!upstream.body) return res.end();
-      let stalled = false;
-      try {
-        await pipeline(
-          Readable.fromWeb(upstream.body),
-          idleGuard(config.streamIdleMs, () => {
-            stalled = true;
-            abort.abort(new Error('upstream went silent'));
-          }),
-          res,
-        );
-      } catch (e) {
-        // The client went away, or the upstream cut or stalled the stream.
-        // Either way the response can't be repaired now.
-        if (stalled) log('Upstream went silent mid-reply');
-        else if (!abort.signal.aborted) log('Stream ended early', e);
-        res.destroy();
+      Readable.fromWeb(upstream.body).on('error', () => res.end()).pipe(res);
+    } catch (e) {
+      if (!controller.signal.aborted) {
+        console.error('upstream failed', e?.message);
+        if (!res.headersSent) res.status(502).json({ error: 'upstream_unavailable' });
       }
-    },
-  );
-
-  app.use('/v1', v1);
-
-  app.use((_req, res) => fail(res, 404, 'not_found', 'Not found.'));
-
-  // Body-parser and other thrown errors.
-  app.use((err, _req, res, _next) => {
-    if (res.headersSent) return res.destroy();
-    if (err?.type === 'entity.too.large') {
-      return fail(res, 413, 'too_large', 'That request is too large.');
     }
-    if (err?.type === 'entity.parse.failed') {
-      return fail(res, 400, 'bad_request', 'The request body is not valid JSON.');
-    }
-    if (err?.status >= 400 && err?.status < 500) {
-      return fail(res, err.status, 'bad_request', 'The request could not be read.');
-    }
-    log('Unhandled error', err);
-    fail(res, 500, 'server_error', 'Something went wrong.');
   });
 
   return app;
 }
+
+module.exports = { createApp };

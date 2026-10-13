@@ -1,7 +1,2 @@
 node_modules/
 .env
-.env.*
-!.env.example
-# Google service account key files
-*service-account*.json
-*-key.json

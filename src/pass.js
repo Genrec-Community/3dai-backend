@@ -1,57 +1,38 @@
-// The pass: a short-lived signed token the app sends with each AI request.
-// It proves this server recently saw an active subscription, so the proxy
-// never has to call Google on the hot path.
+'use strict';
+// Signed, short-lived pass (HS256 JWT) handed to a verified subscriber.
+const crypto = require('node:crypto');
 
-import { createHash } from 'node:crypto';
-import { SignJWT, jwtVerify } from 'jose';
+const b64 = (buf) => Buffer.from(buf).toString('base64url');
 
-const ISSUER = 'threedollarai';
-const AUDIENCE = 'plan';
-
-/** A stable id for a subscriber that doesn't reveal the purchase token. */
-export function subscriberId(purchaseToken) {
-  return createHash('sha256').update(purchaseToken).digest('hex').slice(0, 32);
+function sign(payload, secret) {
+  const head = b64(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
+  const body = b64(JSON.stringify(payload));
+  const mac = crypto.createHmac('sha256', secret).update(`${head}.${body}`).digest('base64url');
+  return `${head}.${body}.${mac}`;
 }
 
-export function createPassIssuer({ secret, ttlSeconds, now = () => Date.now() }) {
-  const key = new TextEncoder().encode(secret);
-
-  return {
-    /**
-     * Signs a pass for `subscriber`. It never outlives the subscription:
-     * `subscriptionExpiresAt` (ms) caps the lifetime.
-     */
-    async issue(subscriber, subscriptionExpiresAt) {
-      const issuedAt = Math.floor(now() / 1000);
-      let expiresAt = issuedAt + ttlSeconds;
-      if (subscriptionExpiresAt) {
-        expiresAt = Math.min(expiresAt, Math.floor(subscriptionExpiresAt / 1000));
-      }
-      const token = await new SignJWT({})
-        .setProtectedHeader({ alg: 'HS256' })
-        .setIssuer(ISSUER)
-        .setAudience(AUDIENCE)
-        .setSubject(subscriber)
-        .setIssuedAt(issuedAt)
-        .setExpirationTime(expiresAt)
-        .sign(key);
-      return { token, expiresAt: expiresAt * 1000 };
-    },
-
-    /** The subscriber id, or null when the pass is missing, forged or expired. */
-    async verify(token) {
-      if (!token) return null;
-      try {
-        const { payload } = await jwtVerify(token, key, {
-          issuer: ISSUER,
-          audience: AUDIENCE,
-          algorithms: ['HS256'],
-          currentDate: new Date(now()),
-        });
-        return typeof payload.sub === 'string' ? payload.sub : null;
-      } catch {
-        return null;
-      }
-    },
-  };
+/** Returns the payload, or null if the pass is forged, malformed or expired. */
+function verify(token, secret, nowMs = Date.now()) {
+  if (typeof token !== 'string') return null;
+  const parts = token.split('.');
+  if (parts.length !== 3) return null;
+  const [head, body, mac] = parts;
+  const expected = crypto.createHmac('sha256', secret).update(`${head}.${body}`).digest();
+  const given = Buffer.from(mac, 'base64url');
+  if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(body, 'base64url').toString('utf8'));
+    if (typeof payload.exp !== 'number' || payload.exp * 1000 <= nowMs) return null;
+    if (typeof payload.sub !== 'string' || !payload.sub) return null;
+    return payload;
+  } catch {
+    return null;
+  }
 }
+
+function issue(uid, ttlSeconds, secret, nowMs = Date.now()) {
+  const iat = Math.floor(nowMs / 1000);
+  return { pass: sign({ sub: uid, iat, exp: iat + ttlSeconds }, secret), expiresAt: (iat + ttlSeconds) * 1000 };
+}
+
+module.exports = { issue, verify };
