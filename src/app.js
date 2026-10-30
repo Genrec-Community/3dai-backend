@@ -11,6 +11,9 @@ class HttpError extends Error {
   }
 }
 
+// What clients see when they ask for models: one entry, never the real id.
+const PUBLIC_MODEL_ID = 'auto';
+
 const bearer = (req) => (req.get('authorization') || '').match(/^Bearer\s+(.+)$/i)?.[1] ?? null;
 
 /**
@@ -18,13 +21,25 @@ const bearer = (req) => (req.get('authorization') || '').match(/^Bearer\s+(.+)$/
  *  verifyFirebaseToken(idToken) -> { uid }   (throws if invalid)
  *  checkSubscription(purchaseToken) -> { valid, temporary, accountId, expiresAt }
  *  fetchImpl                         upstream HTTP client
- *  config: { passSecret, passTtlSeconds, upstreamBase, upstreamKey,
- *            requireAccountBinding, rateLimitPerMin }
+ *  config: { passSecret, passTtlSeconds, upstreamBase, upstreamKey, upstreamModel,
+ *            requireAccountBinding, rateLimitPerMin, authLimitPerMin?,
+ *            maxTokensCap?, upstreamTimeoutMs?, trustProxy? }
+ *
+ * The upstream is any OpenAI-compatible provider. Clients never choose the
+ * model: every chat request is rewritten to `config.upstreamModel`.
  */
 function createApp({ verifyFirebaseToken, checkSubscription, fetchImpl = fetch, config, now = Date.now }) {
   const app = express();
   const allow = createLimiter({ max: config.rateLimitPerMin, now });
+  const allowAuth = createLimiter({ max: config.authLimitPerMin ?? 20, now });
+  const maxTokensCap = config.maxTokensCap ?? 8192;
+  const upstreamTimeoutMs = config.upstreamTimeoutMs ?? 5 * 60_000;
   app.disable('x-powered-by');
+  if (config.trustProxy) app.set('trust proxy', config.trustProxy);
+  app.use((_req, res, next) => {
+    res.set({ 'x-content-type-options': 'nosniff', 'cache-control': 'no-store' });
+    next();
+  });
   app.use(express.json({ limit: '1mb' }));
 
   app.get('/healthz', (_req, res) => res.json({ ok: true }));
@@ -32,6 +47,8 @@ function createApp({ verifyFirebaseToken, checkSubscription, fetchImpl = fetch, 
   // Trade (Firebase login + Play purchase token) for a short-lived pass.
   app.post('/auth', async (req, res) => {
     try {
+      // Slows down anyone hammering the purchase check with guessed tokens.
+      if (!allowAuth(req.ip)) throw new HttpError(429, 'rate_limited');
       const idToken = bearer(req);
       if (!idToken) throw new HttpError(401, 'missing_login');
       let uid;
@@ -69,24 +86,53 @@ function createApp({ verifyFirebaseToken, checkSubscription, fetchImpl = fetch, 
     const path = req.url.replace(/^\/+/, '');
     if (path !== 'chat/completions' && path !== 'models') return res.status(404).end();
 
+    // One model for every subscriber: answer locally, never ask the upstream.
+    if (path === 'models') {
+      if (req.method !== 'GET') return res.status(405).end();
+      return res.json({ object: 'list', data: [{ id: PUBLIC_MODEL_ID, object: 'model', owned_by: '3dollar-ai' }] });
+    }
+    if (req.method !== 'POST') return res.status(405).end();
+
+    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? { ...req.body } : {};
+    body.model = config.upstreamModel;
+    delete body.user;
+    for (const k of ['max_tokens', 'max_completion_tokens']) {
+      if (body[k] !== undefined && !(Number(body[k]) <= maxTokensCap)) body[k] = maxTokensCap;
+    }
+
     const controller = new AbortController();
     res.on('close', () => controller.abort());
+    const timer = setTimeout(() => controller.abort(), upstreamTimeoutMs);
     try {
       const upstream = await fetchImpl(`${config.upstreamBase}/${path}`, {
-        method: req.method,
+        method: 'POST',
         headers: {
           authorization: `Bearer ${config.upstreamKey}`,
-          ...(req.method === 'POST' ? { 'content-type': 'application/json' } : {}),
+          'content-type': 'application/json',
         },
-        body: req.method === 'POST' ? JSON.stringify(req.body ?? {}) : undefined,
+        body: JSON.stringify(body),
         signal: controller.signal,
       });
+      // Our own key or balance is the problem, not the user's: say nothing
+      // about it to the client.
+      if ([401, 402, 403].includes(upstream.status)) {
+        console.error('upstream rejected our credentials/billing', upstream.status);
+        clearTimeout(timer);
+        return res.status(502).json({ error: 'upstream_unavailable' });
+      }
       res.status(upstream.status);
       const type = upstream.headers.get('content-type');
       if (type) res.set('content-type', type);
-      if (!upstream.body) return res.end();
-      Readable.fromWeb(upstream.body).on('error', () => res.end()).pipe(res);
+      if (!upstream.body) {
+        clearTimeout(timer);
+        return res.end();
+      }
+      Readable.fromWeb(upstream.body)
+        .on('error', () => res.end())
+        .on('close', () => clearTimeout(timer))
+        .pipe(res);
     } catch (e) {
+      clearTimeout(timer);
       if (!controller.signal.aborted) {
         console.error('upstream failed', e?.message);
         if (!res.headersSent) res.status(502).json({ error: 'upstream_unavailable' });

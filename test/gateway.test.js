@@ -12,6 +12,8 @@ const config = {
   passTtlSeconds: 3600,
   upstreamBase: 'http://upstream.test/v1',
   upstreamKey: 'REAL-KEY',
+  upstreamModel: 'real-model-x',
+  maxTokensCap: 1000,
   requireAccountBinding: true,
   rateLimitPerMin: 2,
 };
@@ -130,5 +132,51 @@ test('/v1: client never learns the real key on upstream failure', async () => {
   const res = await post(s.base, '/v1/chat/completions', p, {});
   assert.equal(res.status, 502);
   assert.ok(!(await res.text()).includes('REAL-KEY'));
+  s.close();
+});
+
+test('/v1: client cannot choose the model or exceed the token cap', async () => {
+  const s = await start();
+  const { pass: p } = pass.issue('u1', 60, SECRET);
+  await post(s.base, '/v1/chat/completions', p, { model: 'gpt-expensive', max_tokens: 999999, user: 'x', messages: [] });
+  const sent = JSON.parse(s.calls[0].init.body);
+  assert.equal(sent.model, 'real-model-x');
+  assert.equal(sent.max_tokens, 1000);
+  assert.equal('user' in sent, false);
+  assert.deepEqual(sent.messages, []);
+  s.close();
+});
+
+test('/v1/models: one public entry, answered without calling upstream', async () => {
+  const s = await start();
+  const { pass: p } = pass.issue('u1', 60, SECRET);
+  const res = await fetch(s.base + '/v1/models', { headers: { authorization: `Bearer ${p}` } });
+  assert.equal(res.status, 200);
+  const body = await res.json();
+  assert.equal(body.data.length, 1);
+  assert.ok(!JSON.stringify(body).includes('real-model-x'));
+  assert.equal(s.calls.length, 0);
+  assert.equal((await fetch(s.base + '/v1/models')).status, 401);
+  s.close();
+});
+
+test('/v1: upstream auth/billing errors are hidden from the client', async () => {
+  for (const status of [401, 402, 403]) {
+    const s = await start({
+      fetchImpl: async () => new Response('{"error":"bad key REAL-KEY"}', { status }),
+    });
+    const { pass: p } = pass.issue('u1', 60, SECRET);
+    const res = await post(s.base, '/v1/chat/completions', p, {});
+    assert.equal(res.status, 502);
+    assert.ok(!(await res.text()).includes('REAL-KEY'));
+    s.close();
+  }
+});
+
+test('/auth: rate limited per client', async () => {
+  const s = await start({ config: { ...config, authLimitPerMin: 2 } });
+  const codes = [];
+  for (let i = 0; i < 3; i++) codes.push((await post(s.base, '/auth', 'good-login', { purchaseToken: 't' })).status);
+  assert.deepEqual(codes, [200, 200, 429]);
   s.close();
 });

@@ -9,11 +9,20 @@ function required(name) {
   return v;
 }
 
+const passSecret = required('PASS_SECRET');
+if (passSecret.length < 32) throw new Error('PASS_SECRET must be at least 32 characters');
+
 const config = {
-  passSecret: required('PASS_SECRET'),
-  passTtlSeconds: Number(process.env.PASS_TTL_SECONDS || 24 * 3600),
+  passSecret,
+  // Short, so a cancelled or refunded subscription loses access quickly.
+  passTtlSeconds: Number(process.env.PASS_TTL_SECONDS || 3600),
+  // Any OpenAI-compatible provider, e.g. https://api.openai.com/v1
   upstreamBase: required('UPSTREAM_BASE_URL').replace(/\/+$/, ''),
   upstreamKey: required('UPSTREAM_API_KEY'),
+  // The single model every 3Dollar subscriber gets.
+  upstreamModel: required('UPSTREAM_MODEL'),
+  maxTokensCap: Number(process.env.MAX_TOKENS_CAP || 8192),
+  trustProxy: Number(process.env.TRUST_PROXY_HOPS ?? 1),
   requireAccountBinding: process.env.REQUIRE_ACCOUNT_BINDING !== 'false',
   rateLimitPerMin: Number(process.env.RATE_LIMIT_PER_MIN || 30),
 };
