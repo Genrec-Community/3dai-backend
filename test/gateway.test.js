@@ -172,7 +172,7 @@ test('/v1: upstream auth/billing errors are hidden from the client', async () =>
   }
 });
 
-test('/auth: rate limited per client', async () => {
+test('/auth: rate limited per signed-in user', async () => {
   const s = await start({ config: { ...config, authLimitPerMin: 2 } });
   const codes = [];
   for (let i = 0; i < 3; i++) codes.push((await post(s.base, '/auth', 'good-login', { purchaseToken: 't' })).status);

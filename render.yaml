@@ -1,0 +1,27 @@
+# Render Blueprint: New > Blueprint, point it at this repo.
+# Secrets marked `sync: false` are asked for in the dashboard, never stored here.
+services:
+  - type: web
+    name: threedai-backend
+    runtime: node
+    plan: free
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+    healthCheckPath: /healthz
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: PASS_SECRET
+        generateValue: true
+      - key: PLAY_PACKAGE_NAME
+        value: com.dotwellabs.threedollarai
+      - key: FIREBASE_PROJECT_ID
+        sync: false
+      - key: GOOGLE_PLAY_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: UPSTREAM_BASE_URL
+        sync: false
+      - key: UPSTREAM_API_KEY
+        sync: false
+      - key: UPSTREAM_MODEL
+        sync: false

@@ -21,7 +21,6 @@ const config = {
   upstreamKey: required('UPSTREAM_API_KEY'),
   // The single model every 3Dollar subscriber gets.
   upstreamModel: required('UPSTREAM_MODEL'),
-  trustProxy: Number(process.env.TRUST_PROXY_HOPS ?? 1),
   requireAccountBinding: process.env.REQUIRE_ACCOUNT_BINDING !== 'false',
   rateLimitPerMin: Number(process.env.RATE_LIMIT_PER_MIN || 30),
 };

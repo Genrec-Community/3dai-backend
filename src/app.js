@@ -22,7 +22,7 @@ const bearer = (req) => (req.get('authorization') || '').match(/^Bearer\s+(.+)$/
  *  checkSubscription(purchaseToken) -> { valid, temporary, accountId, expiresAt }
  *  fetchImpl                         upstream HTTP client
  *  config: { passSecret, passTtlSeconds, upstreamBase, upstreamKey, upstreamModel,
- *            requireAccountBinding, rateLimitPerMin, authLimitPerMin?, trustProxy? }
+ *            requireAccountBinding, rateLimitPerMin, authLimitPerMin? }
  *
  * The upstream is any OpenAI-compatible provider. Clients never choose the
  * model: every chat request is rewritten to `config.upstreamModel`.
@@ -32,7 +32,6 @@ function createApp({ verifyFirebaseToken, checkSubscription, fetchImpl = fetch, 
   const allow = createLimiter({ max: config.rateLimitPerMin, now });
   const allowAuth = createLimiter({ max: config.authLimitPerMin ?? 20, now });
   app.disable('x-powered-by');
-  if (config.trustProxy) app.set('trust proxy', config.trustProxy);
   app.use((_req, res, next) => {
     res.set({ 'x-content-type-options': 'nosniff', 'cache-control': 'no-store' });
     next();
@@ -44,8 +43,6 @@ function createApp({ verifyFirebaseToken, checkSubscription, fetchImpl = fetch, 
   // Trade (Firebase login + Play purchase token) for a short-lived pass.
   app.post('/auth', async (req, res) => {
     try {
-      // Slows down anyone hammering the purchase check with guessed tokens.
-      if (!allowAuth(req.ip)) throw new HttpError(429, 'rate_limited');
       const idToken = bearer(req);
       if (!idToken) throw new HttpError(401, 'missing_login');
       let uid;
@@ -54,6 +51,9 @@ function createApp({ verifyFirebaseToken, checkSubscription, fetchImpl = fetch, 
       } catch {
         throw new HttpError(401, 'invalid_login');
       }
+      // Keyed on the verified user (not the IP, which is shared behind the
+      // host's proxies) to slow down guessing of purchase tokens.
+      if (!allowAuth(uid)) throw new HttpError(429, 'rate_limited');
       const purchaseToken = req.body?.purchaseToken;
       if (typeof purchaseToken !== 'string' || !purchaseToken.trim()) {
         throw new HttpError(400, 'purchase_token_required');
