@@ -13,7 +13,6 @@ const config = {
   upstreamBase: 'http://upstream.test/v1',
   upstreamKey: 'REAL-KEY',
   upstreamModel: 'real-model-x',
-  maxTokensCap: 1000,
   requireAccountBinding: true,
   rateLimitPerMin: 2,
 };
@@ -135,13 +134,13 @@ test('/v1: client never learns the real key on upstream failure', async () => {
   s.close();
 });
 
-test('/v1: client cannot choose the model or exceed the token cap', async () => {
+test('/v1: client cannot choose the model; token limits are left alone', async () => {
   const s = await start();
   const { pass: p } = pass.issue('u1', 60, SECRET);
-  await post(s.base, '/v1/chat/completions', p, { model: 'gpt-expensive', max_tokens: 999999, user: 'x', messages: [] });
+  await post(s.base, '/v1/chat/completions', p, { model: 'gpt-expensive', max_tokens: 64000, user: 'x', messages: [] });
   const sent = JSON.parse(s.calls[0].init.body);
   assert.equal(sent.model, 'real-model-x');
-  assert.equal(sent.max_tokens, 1000);
+  assert.equal(sent.max_tokens, 64000);
   assert.equal('user' in sent, false);
   assert.deepEqual(sent.messages, []);
   s.close();

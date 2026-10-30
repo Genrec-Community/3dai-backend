@@ -22,8 +22,7 @@ const bearer = (req) => (req.get('authorization') || '').match(/^Bearer\s+(.+)$/
  *  checkSubscription(purchaseToken) -> { valid, temporary, accountId, expiresAt }
  *  fetchImpl                         upstream HTTP client
  *  config: { passSecret, passTtlSeconds, upstreamBase, upstreamKey, upstreamModel,
- *            requireAccountBinding, rateLimitPerMin, authLimitPerMin?,
- *            maxTokensCap?, upstreamTimeoutMs?, trustProxy? }
+ *            requireAccountBinding, rateLimitPerMin, authLimitPerMin?, trustProxy? }
  *
  * The upstream is any OpenAI-compatible provider. Clients never choose the
  * model: every chat request is rewritten to `config.upstreamModel`.
@@ -32,8 +31,6 @@ function createApp({ verifyFirebaseToken, checkSubscription, fetchImpl = fetch, 
   const app = express();
   const allow = createLimiter({ max: config.rateLimitPerMin, now });
   const allowAuth = createLimiter({ max: config.authLimitPerMin ?? 20, now });
-  const maxTokensCap = config.maxTokensCap ?? 8192;
-  const upstreamTimeoutMs = config.upstreamTimeoutMs ?? 5 * 60_000;
   app.disable('x-powered-by');
   if (config.trustProxy) app.set('trust proxy', config.trustProxy);
   app.use((_req, res, next) => {
@@ -96,13 +93,9 @@ function createApp({ verifyFirebaseToken, checkSubscription, fetchImpl = fetch, 
     const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? { ...req.body } : {};
     body.model = config.upstreamModel;
     delete body.user;
-    for (const k of ['max_tokens', 'max_completion_tokens']) {
-      if (body[k] !== undefined && !(Number(body[k]) <= maxTokensCap)) body[k] = maxTokensCap;
-    }
 
     const controller = new AbortController();
     res.on('close', () => controller.abort());
-    const timer = setTimeout(() => controller.abort(), upstreamTimeoutMs);
     try {
       const upstream = await fetchImpl(`${config.upstreamBase}/${path}`, {
         method: 'POST',
@@ -117,22 +110,16 @@ function createApp({ verifyFirebaseToken, checkSubscription, fetchImpl = fetch, 
       // about it to the client.
       if ([401, 402, 403].includes(upstream.status)) {
         console.error('upstream rejected our credentials/billing', upstream.status);
-        clearTimeout(timer);
         return res.status(502).json({ error: 'upstream_unavailable' });
       }
       res.status(upstream.status);
       const type = upstream.headers.get('content-type');
       if (type) res.set('content-type', type);
-      if (!upstream.body) {
-        clearTimeout(timer);
-        return res.end();
-      }
+      if (!upstream.body) return res.end();
       Readable.fromWeb(upstream.body)
         .on('error', () => res.end())
-        .on('close', () => clearTimeout(timer))
         .pipe(res);
     } catch (e) {
-      clearTimeout(timer);
       if (!controller.signal.aborted) {
         console.error('upstream failed', e?.message);
         if (!res.headersSent) res.status(502).json({ error: 'upstream_unavailable' });
